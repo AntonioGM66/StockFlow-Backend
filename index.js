@@ -64,6 +64,38 @@ app.get('/productos', async (req, res) => {
 
 const PORT = process.env.PORT || 4000;
 
+// Login de usuario
+app.post('/login', async (req, res) => {
+    try {
+        const { usuario, password } = req.body;
+
+        const result = await pool.query(
+            'SELECT * FROM usuario WHERE usuario = $1 AND password_hash = $2 AND estado = $3',
+            [usuario, password, 'Activo']
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(401).json({
+                success: false,
+                message: 'Usuario o contraseña inválidos'
+            });
+        }
+
+        res.json({
+            success: true,
+            message: 'Acceso correcto',
+            usuario: result.rows[0]
+        });
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({
+            success: false,
+            message: 'Error en el servidor'
+        });
+    }
+});
+
 app.listen(PORT, () => {
     console.log(`Servidor corriendo en puerto ${PORT}`);
 });
