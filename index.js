@@ -135,16 +135,27 @@ app.post('/usuarios', async (req, res) => {
             });
         }
 
-        const result = await pool.query(
-            [
-    nombre,
-    apellidoPaterno,
-    apellidoMaterno,
-    usuario,
-    correo,
-    password,
-    'Activo'
-]
+const result = await pool.query(
+    `INSERT INTO usuario (
+        nombre,
+        apellido_paterno,
+        apellido_materno,
+        usuario,
+        correo,
+        password_hash,
+        estado
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
+    RETURNING id_usuario, nombre, apellido_paterno, apellido_materno, usuario, correo, estado`,
+    [
+        nombre,
+        apellidoPaterno,
+        apellidoMaterno,
+        usuario,
+        correo,
+        password,
+        'Activo'
+    ]
 );
 
         res.json({
@@ -158,6 +169,69 @@ app.post('/usuarios', async (req, res) => {
         res.status(500).json({
             success: false,
             message: 'Error al crear la cuenta'
+        });
+    }
+});
+
+// Verificar correo para recuperación
+app.post('/recuperar-password', async (req, res) => {
+    try {
+        const { correo } = req.body;
+
+        const result = await pool.query(
+            'SELECT id_usuario, correo FROM usuario WHERE correo = $1 AND estado = $2',
+            [correo, 'Activo']
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Correo no registrado'
+            });
+        }
+
+        res.json({
+            success: true,
+            message: 'Correo verificado correctamente',
+            correo: result.rows[0].correo
+        });
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({
+            success: false,
+            message: 'Error en el servidor'
+        });
+    }
+});
+
+// Cambiar contraseña
+app.put('/cambiar-password', async (req, res) => {
+    try {
+        const { correo, nuevaPassword, confirmarPassword } = req.body;
+
+        if (nuevaPassword !== confirmarPassword) {
+            return res.status(400).json({
+                success: false,
+                message: 'Las contraseñas no coinciden'
+            });
+        }
+
+        await pool.query(
+            'UPDATE usuario SET password_hash = $1 WHERE correo = $2',
+            [nuevaPassword, correo]
+        );
+
+        res.json({
+            success: true,
+            message: 'Contraseña actualizada correctamente'
+        });
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({
+            success: false,
+            message: 'Error al cambiar contraseña'
         });
     }
 });
