@@ -96,6 +96,104 @@ app.post('/login', async (req, res) => {
     }
 });
 
+// Crear cuenta de usuario
+app.post('/usuarios', async (req, res) => {
+    try {
+        const {
+            nombre,
+            apellidoPaterno,
+            apellidoMaterno,
+            usuario,
+            correo,
+            password,
+            confirmarPassword
+} = req.body;
+
+        if (!nombre || !apellidoPaterno || !apellidoMaterno || !usuario || !correo || !password || !confirmarPassword) {
+            return res.status(400).json({
+                success: false,
+                message: 'Todos los campos son obligatorios'
+            });
+        }
+
+        if (password !== confirmarPassword) {
+            return res.status(400).json({
+                success: false,
+                message: 'Las contraseñas no coinciden'
+            });
+        }
+
+        const usuarioExistente = await pool.query(
+            'SELECT * FROM usuario WHERE usuario = $1 OR correo = $2',
+            [usuario, correo]
+        );
+
+        if (usuarioExistente.rows.length > 0) {
+            return res.status(409).json({
+                success: false,
+                message: 'El usuario o correo ya existe'
+            });
+        }
+
+        const result = await pool.query(
+            [
+    nombre,
+    apellidoPaterno,
+    apellidoMaterno,
+    usuario,
+    correo,
+    password,
+    'Activo'
+]
+);
+
+        res.json({
+            success: true,
+            message: 'Cuenta creada exitosamente',
+            usuario: result.rows[0]
+        });
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({
+            success: false,
+            message: 'Error al crear la cuenta'
+        });
+    }
+});
+
+// Indicadores del dashboard
+app.get('/dashboard/resumen', async (req, res) => {
+    try {
+        const totalProductos = await pool.query(
+            'SELECT COUNT(*) AS total FROM producto WHERE estado = $1',
+            ['Activo']
+        );
+
+        const productosBajoStock = await pool.query(
+            'SELECT COUNT(*) AS total FROM producto WHERE stock_actual <= stock_minimo AND estado = $1',
+            ['Activo']
+        );
+
+        const ventasDia = await pool.query(
+            `SELECT COALESCE(SUM(total), 0) AS total
+            FROM venta
+            WHERE DATE(fecha_venta) = CURRENT_DATE
+            AND estado = 'Completada'`
+        );
+
+        res.json({
+            totalProductos: totalProductos.rows[0].total,
+            ventasDia: ventasDia.rows[0].total,
+            productosBajoStock: productosBajoStock.rows[0].total
+        });
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ mensaje: 'Error al obtener resumen del dashboard' });
+    }
+});
+
 app.listen(PORT, () => {
     console.log(`Servidor corriendo en puerto ${PORT}`);
 });
