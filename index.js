@@ -733,9 +733,9 @@ app.put('/marcas/:id', async (req, res) => {
 
         const result = await pool.query(
             `UPDATE marca
-             SET nombre = $1,
-                 descripcion = $2
-             WHERE id_marca = $3
+            SET nombre = $1,
+                descripcion = $2
+            WHERE id_marca = $3
              RETURNING *`,
             [nombreLimpio, descripcionLimpia || null, id]
         );
@@ -769,11 +769,11 @@ app.put('/marcas/:id/estado', async (req, res) => {
 
         const result = await pool.query(
             `UPDATE marca
-             SET estado = CASE
+            SET estado = CASE
                 WHEN estado = 'Activo' THEN 'Inactivo'
                 ELSE 'Activo'
-             END
-             WHERE id_marca = $1
+            END
+            WHERE id_marca = $1
              RETURNING *`,
             [id]
         );
@@ -799,6 +799,176 @@ app.put('/marcas/:id/estado', async (req, res) => {
             success: false,
             message: 'Error al cambiar estado de marca'
         });
+    }
+});
+
+// Rutas para proveedores
+app.get('/proveedores', async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT
+                id_provedor AS id_proveedor,
+                nombre,
+                apellido_paterno,
+                apellido_materno,
+                razon_social,
+                rfc_identificacion,
+                telefono,
+                correo_electronico,
+                estado
+            FROM proveedor
+            ORDER BY id_provedor`
+        );
+        res.json(result.rows);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ success: false, message: 'Error al obtener proveedores' });
+    }
+});
+
+app.post('/proveedores', async (req, res) => {
+    try {
+        const { razonSocial, rfc, telefono, correo } = req.body;
+        const razonSocialLimpia = typeof razonSocial === 'string' ? razonSocial.trim() : '';
+        const rfcLimpio = typeof rfc === 'string' ? rfc.trim() : '';
+        const telefonoLimpio = typeof telefono === 'string' ? telefono.trim() : '';
+        const correoLimpio = typeof correo === 'string' ? correo.trim() : '';
+
+        if (!razonSocialLimpia || !rfcLimpio) {
+            return res.status(400).json({
+                success: false,
+                message: 'La razón social y el RFC son obligatorios'
+            });
+        }
+
+        const proveedorExistente = await pool.query(
+            'SELECT id_provedor FROM proveedor WHERE UPPER(rfc_identificacion) = UPPER($1)',
+            [rfcLimpio]
+        );
+
+        if (proveedorExistente.rows.length > 0) {
+            return res.status(409).json({
+                success: false,
+                message: 'Ya existe un proveedor con ese RFC'
+            });
+        }
+
+        const result = await pool.query(
+            `INSERT INTO proveedor (razon_social, rfc_identificacion, telefono, correo_electronico, estado)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING id_provedor AS id_proveedor, razon_social, rfc_identificacion,
+                       telefono, correo_electronico, estado`,
+            [
+                razonSocialLimpia,
+                rfcLimpio,
+                telefonoLimpio || null,
+                correoLimpio || null,
+                'Activo'
+            ]
+        );
+
+        res.status(201).json({ success: true, message: 'Proveedor guardado correctamente', proveedor: result.rows[0] });
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ success: false, message: 'Error al guardar proveedor' });
+    }
+});
+
+app.put('/proveedores/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { razonSocial, rfc, telefono, correo } = req.body;
+        const razonSocialLimpia = typeof razonSocial === 'string' ? razonSocial.trim() : '';
+        const rfcLimpio = typeof rfc === 'string' ? rfc.trim() : '';
+        const telefonoLimpio = typeof telefono === 'string' ? telefono.trim() : '';
+        const correoLimpio = typeof correo === 'string' ? correo.trim() : '';
+
+        if (!razonSocialLimpia || !rfcLimpio) {
+            return res.status(400).json({
+                success: false,
+                message: 'La razón social y el RFC son obligatorios'
+            });
+        }
+
+        const proveedorExistente = await pool.query(
+            `SELECT id_provedor
+            FROM proveedor
+            WHERE UPPER(rfc_identificacion) = UPPER($1)
+            AND id_provedor <> $2`,
+            [rfcLimpio, id]
+        );
+
+        if (proveedorExistente.rows.length > 0) {
+            return res.status(409).json({
+                success: false,
+                message: 'Ya existe otro proveedor con ese RFC'
+            });
+        }
+
+        const result = await pool.query(
+            `UPDATE proveedor
+             SET razon_social = $1,
+                 rfc_identificacion = $2,
+                 telefono = $3,
+                 correo_electronico = $4
+             WHERE id_provedor = $5
+             RETURNING id_provedor AS id_proveedor, razon_social, rfc_identificacion,
+                       telefono, correo_electronico, estado`,
+            [
+                razonSocialLimpia,
+                rfcLimpio,
+                telefonoLimpio || null,
+                correoLimpio || null,
+                id
+            ]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Proveedor no encontrado'
+            });
+        }
+
+        res.json({ success: true, message: 'Proveedor actualizado correctamente', proveedor: result.rows[0] });
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ success: false, message: 'Error al actualizar proveedor' });
+    }
+});
+
+app.put('/proveedores/:id/estado', async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        const result = await pool.query(
+            `UPDATE proveedor
+             SET estado = CASE
+                WHEN estado = 'Activo' THEN 'Inactivo'
+                ELSE 'Activo'
+             END
+             WHERE id_provedor = $1
+             RETURNING id_provedor AS id_proveedor, razon_social, rfc_identificacion,
+                       telefono, correo_electronico, estado`,
+            [id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Proveedor no encontrado'
+            });
+        }
+
+        const nuevoEstado = result.rows[0].estado;
+
+        res.json({ success: true, message: `Proveedor ${nuevoEstado.toLowerCase()} correctamente`, proveedor: result.rows[0] });
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ success: false, message: 'Error al cambiar estado del proveedor' });
     }
 });
 
