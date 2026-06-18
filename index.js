@@ -37,28 +37,67 @@ app.get('/db-test', async (req, res) => {
 // Crear producto
 app.post('/productos', async (req, res) => {
     try {
-        const { nombre, precio, stock } = req.body;
+        const {
+            codigoBarras,
+            nombre,
+            descripcion,
+            idCategoria,
+            idMarca,
+            precioVenta,
+            stockActual,
+            stockMinimo
+        } = req.body;
 
-        const result = await pool.query(
-            'INSERT INTO productos (nombre, precio, stock) VALUES ($1, $2, $3) RETURNING *',
-            [nombre, precio, stock]
+        const codigoExistente = await pool.query(
+            'SELECT * FROM producto WHERE codigo_barras = $1',
+            [codigoBarras]
         );
 
-        res.json(result.rows[0]);
-    } catch (error) {
-        console.error(error);
-        res.status(500).send('Error al insertar producto');
-    }
-});
+        if (codigoExistente.rows.length > 0) {
+            return res.status(409).json({
+                success: false,
+                message: 'Código de barras ya registrado'
+            });
+        }
 
-// Ver productos
-app.get('/productos', async (req, res) => {
-    try {
-        const result = await pool.query('SELECT * FROM productos');
-        res.json(result.rows);
+        const result = await pool.query(
+            `INSERT INTO producto (
+                codigo_barras,
+                nombre,
+                descripcion,
+                id_categoria,
+                id_marca,
+                precio_venta,
+                stock_actual,
+                stock_minimo,
+                estado
+            )
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+            RETURNING *`,
+            [
+                codigoBarras,
+                nombre,
+                descripcion,
+                idCategoria,
+                idMarca,
+                precioVenta,
+                stockActual,
+                stockMinimo,
+                'Activo'
+            ]
+        );
+
+        res.json({
+            success: true,
+            producto: result.rows[0]
+        });
+
     } catch (error) {
         console.error(error);
-        res.status(500).send('Error al obtener productos');
+        res.status(500).json({
+            success: false,
+            message: 'Error al registrar producto'
+        });
     }
 });
 
@@ -265,6 +304,200 @@ app.get('/dashboard/resumen', async (req, res) => {
     } catch (error) {
         console.error(error);
         res.status(500).json({ mensaje: 'Error al obtener resumen del dashboard' });
+    }
+});
+
+// Obtener categorías
+app.get('/categorias', async (req, res) => {
+    try {
+        const result = await pool.query(
+            'SELECT * FROM categoria ORDER BY nombre'
+        );
+
+        res.json(result.rows);
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).send('Error al obtener categorías');
+    }
+});
+
+// Obtener marcas
+app.get('/marcas', async (req, res) => {
+    try {
+        const result = await pool.query(
+            'SELECT * FROM marca ORDER BY nombre'
+        );
+
+        res.json(result.rows);
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).send('Error al obtener marcas');
+    }
+});
+
+// Consultar productos
+app.get('/productos', async (req, res) => {
+    try {
+        const { buscar } = req.query;
+
+        let query = `
+            SELECT
+                p.id_producto,
+                p.codigo_barras,
+                p.nombre,
+                p.descripcion,
+                p.id_categoria,
+                p.id_marca,
+                c.nombre AS categoria,
+                m.nombre AS marca,
+                p.precio_venta,
+                p.stock_actual,
+                p.stock_minimo,
+                p.estado
+            FROM producto p
+            LEFT JOIN categoria c ON p.id_categoria = c.id_categoria
+            LEFT JOIN marca m ON p.id_marca = m.id_marca
+        `;
+
+        let params = [];
+
+        if (buscar) {
+            query += `
+                WHERE p.nombre ILIKE $1
+                OR p.codigo_barras ILIKE $1
+            `;
+            params.push(`%${buscar}%`);
+        }
+
+        query += ` ORDER BY p.id_producto`;
+
+        const result = await pool.query(query, params);
+
+        res.json(result.rows);
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({
+            success: false,
+            message: 'Error al obtener productos'
+        });
+    }
+});
+
+// Editar producto
+app.put('/productos/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        const {
+            codigoBarras,
+            nombre,
+            descripcion,
+            idCategoria,
+            idMarca,
+            precioVenta,
+            stockActual,
+            stockMinimo
+        } = req.body;
+
+        const codigoExistente = await pool.query(
+            `SELECT * FROM producto 
+            WHERE codigo_barras = $1 
+            AND id_producto <> $2`,
+            [codigoBarras, id]
+        );
+
+        if (codigoExistente.rows.length > 0) {
+            return res.status(409).json({
+                success: false,
+                message: 'Código de barras ya registrado en otro producto'
+            });
+        }
+
+        const result = await pool.query(
+            `UPDATE producto SET
+                codigo_barras = $1,
+                nombre = $2,
+                descripcion = $3,
+                id_categoria = $4,
+                id_marca = $5,
+                precio_venta = $6,
+                stock_actual = $7,
+                stock_minimo = $8
+            WHERE id_producto = $9
+             RETURNING *`,
+            [
+                codigoBarras,
+                nombre,
+                descripcion,
+                idCategoria,
+                idMarca,
+                precioVenta,
+                stockActual,
+                stockMinimo,
+                id
+            ]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Producto no encontrado'
+            });
+        }
+
+        res.json({
+            success: true,
+            message: 'Producto actualizado correctamente',
+            producto: result.rows[0]
+        });
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({
+            success: false,
+            message: 'Error al actualizar producto'
+        });
+    }
+});
+
+// Activar / Desactivar producto
+app.put('/productos/:id/estado', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { estado } = req.body;
+
+        const nuevoEstado = estado === 'Activo' ? 'Inactivo' : 'Activo';
+
+        const result = await pool.query(
+            `UPDATE producto
+            SET estado = $1
+            WHERE id_producto = $2
+             RETURNING *`,
+            [nuevoEstado, id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Producto no encontrado'
+            });
+        }
+
+        res.json({
+            success: true,
+            message: `Producto ${nuevoEstado.toLowerCase()} correctamente`,
+            producto: result.rows[0]
+        });
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({
+            success: false,
+            message: 'Error al cambiar estado del producto'
+        });
     }
 });
 
