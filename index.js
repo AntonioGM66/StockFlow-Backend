@@ -972,6 +972,440 @@ app.put('/proveedores/:id/estado', async (req, res) => {
     }
 });
 
+// Catálogos y resumen para inventario
+app.get('/inventario/resumen', async (req, res) => {
+    try {
+        const [productos, unidades, bajoStock, agotados] = await Promise.all([
+            pool.query(`SELECT COUNT(*) AS total FROM producto WHERE estado = 'Activo'`),
+            pool.query(`SELECT COALESCE(SUM(stock_actual), 0) AS total FROM producto WHERE estado = 'Activo'`),
+            pool.query(`SELECT COUNT(*) AS total
+                        FROM producto
+                        WHERE stock_actual <= stock_minimo AND stock_actual > 0
+                        AND estado = 'Activo'`),
+            pool.query(`SELECT COUNT(*) AS total
+                        FROM producto
+                        WHERE stock_actual <= 0 AND estado = 'Activo'`)
+        ]);
+
+        res.json({
+            totalProductos: Number(productos.rows[0].total),
+            totalUnidades: Number(unidades.rows[0].total),
+            productosBajoStock: Number(bajoStock.rows[0].total),
+            productosAgotados: Number(agotados.rows[0].total)
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({
+            success: false,
+            message: 'Error al obtener el resumen de inventario'
+        });
+    }
+});
+
+app.get('/inventario/catalogos', async (req, res) => {
+    try {
+        const [productos, proveedores] = await Promise.all([
+            pool.query(
+                `SELECT id_producto, codigo_barras, nombre, stock_actual, stock_minimo
+                FROM producto
+                WHERE estado = 'Activo'
+                ORDER BY nombre`
+            ),
+            pool.query(
+                `SELECT id_provedor AS id_proveedor, razon_social
+                FROM proveedor
+                WHERE estado = 'Activo'
+                ORDER BY razon_social`
+            )
+        ]);
+
+        res.json({
+            productos: productos.rows,
+            proveedores: proveedores.rows
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({
+            success: false,
+            message: 'Error al obtener los catálogos de inventario'
+        });
+    }
+});
+
+// Registrar una entrada y actualizar existencias de forma atómica
+app.post('/inventario/entradas', async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+        const { idProveedor, idUsuario, observaciones, detalles } = req.body;
+        const proveedorId = Number(idProveedor);
+        const usuarioId = Number(idUsuario);
+
+        if (
+            !Number.isInteger(proveedorId) ||
+            !Number.isInteger(usuarioId) ||
+            !Array.isArray(detalles) ||
+            detalles.length === 0
+        ) {
+            return res.status(400).json({
+                success: false,
+                message: 'Proveedor, usuario y al menos un producto son obligatorios'
+            });
+        }
+
+        await client.query('BEGIN');
+
+        const proveedor = await client.query(
+            `SELECT id_provedor FROM proveedor
+            WHERE id_provedor = $1 AND estado = 'Activo'`,
+            [proveedorId]
+        );
+
+        if (proveedor.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({
+                success: false,
+                message: 'Proveedor no encontrado o inactivo'
+            });
+        }
+
+        const entrada = await client.query(
+            `INSERT INTO entrada_inventario
+                (id_provedor, observaciones, id_usuario)
+            VALUES ($1, $2, $3)
+            RETURNING id_entrada_inventario, fecha_entrada`,
+            [
+                proveedorId,
+                typeof observaciones === 'string' ? observaciones.trim() || null : null,
+                usuarioId
+            ]
+        );
+
+        const idEntrada = entrada.rows[0].id_entrada_inventario;
+        const productosRegistrados = new Set();
+
+        for (const detalle of detalles) {
+            const idProducto = Number(detalle.idProducto);
+            const cantidad = Number(detalle.cantidad);
+            const costoUnitario = Number(detalle.costoUnitario);
+
+            if (
+                !Number.isInteger(idProducto) ||
+                !Number.isInteger(cantidad) ||
+                cantidad <= 0 ||
+                !Number.isFinite(costoUnitario) ||
+                costoUnitario < 0
+            ) {
+                throw new Error('Los datos de uno de los productos no son válidos');
+            }
+
+            if (productosRegistrados.has(idProducto)) {
+                throw new Error('No se puede agregar el mismo producto dos veces');
+            }
+
+            productosRegistrados.add(idProducto);
+
+            const producto = await client.query(
+                `SELECT id_producto, stock_actual
+                FROM producto
+                WHERE id_producto = $1 AND estado = 'Activo'
+                FOR UPDATE`,
+                [idProducto]
+            );
+
+            if (producto.rows.length === 0) {
+                throw new Error('Uno de los productos no existe o está inactivo');
+            }
+
+            const stockAnterior = Number(producto.rows[0].stock_actual);
+            const stockResultante = stockAnterior + cantidad;
+            const subtotal = cantidad * costoUnitario;
+
+            await client.query(
+                `INSERT INTO detalle_entrada_inventario
+                    (id_entrada_inventario, id_producto, cantidad, costo_unitario, subtotal)
+                VALUES ($1, $2, $3, $4, $5)`,
+                [idEntrada, idProducto, cantidad, costoUnitario, subtotal]
+            );
+
+            await client.query(
+                `UPDATE producto SET stock_actual = $1 WHERE id_producto = $2`,
+                [stockResultante, idProducto]
+            );
+
+            await client.query(
+                `INSERT INTO kardex
+                    (id_producto, tipo_movimiento, cantidad, stock_anterior,
+                     stock_resultante, referencia, id_usuario)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+                [
+                    idProducto,
+                    'Entrada',
+                    cantidad,
+                    stockAnterior,
+                    stockResultante,
+                    `Entrada #${idEntrada}`,
+                    usuarioId
+                ]
+            );
+        }
+
+        await client.query('COMMIT');
+
+        res.status(201).json({
+            success: true,
+            message: 'Entrada registrada y existencias actualizadas correctamente',
+            entrada: entrada.rows[0]
+        });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error(error);
+        res.status(400).json({
+            success: false,
+            message: error.message || 'Error al registrar la entrada de inventario'
+        });
+    } finally {
+        client.release();
+    }
+});
+
+app.get('/inventario/entradas', async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT
+                e.id_entrada_inventario,
+                e.fecha_entrada,
+                p.nombre AS producto,
+                pr.razon_social AS proveedor,
+                d.cantidad,
+                d.costo_unitario,
+                d.subtotal
+            FROM entrada_inventario e
+            INNER JOIN detalle_entrada_inventario d
+                ON d.id_entrada_inventario = e.id_entrada_inventario
+            INNER JOIN producto p ON p.id_producto = d.id_producto
+            INNER JOIN proveedor pr ON pr.id_provedor = e.id_provedor
+            ORDER BY e.fecha_entrada DESC, d.id_detalle_entrada DESC
+            LIMIT 100`
+        );
+
+        res.json(result.rows);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({
+            success: false,
+            message: 'Error al consultar el historial de entradas'
+        });
+    }
+});
+
+// Ajuste manual controlado de existencias
+app.post('/inventario/ajustes', async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+        const { idProducto, tipo, cantidad, motivo, idUsuario } = req.body;
+        const productoId = Number(idProducto);
+        const usuarioId = Number(idUsuario);
+        const cantidadAjuste = Number(cantidad);
+        const tipoNormalizado = typeof tipo === 'string' ? tipo.trim() : '';
+        const motivoLimpio = typeof motivo === 'string' ? motivo.trim() : '';
+
+        if (
+            !Number.isInteger(productoId) ||
+            !Number.isInteger(usuarioId) ||
+            !Number.isInteger(cantidadAjuste) ||
+            cantidadAjuste <= 0 ||
+            !['Entrada', 'Salida'].includes(tipoNormalizado) ||
+            !motivoLimpio
+        ) {
+            return res.status(400).json({
+                success: false,
+                message: 'Producto, tipo, cantidad, motivo y usuario son obligatorios'
+            });
+        }
+
+        await client.query('BEGIN');
+
+        const producto = await client.query(
+            `SELECT id_producto, stock_actual
+            FROM producto
+            WHERE id_producto = $1 AND estado = 'Activo'
+            FOR UPDATE`,
+            [productoId]
+        );
+
+        if (producto.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({
+                success: false,
+                message: 'Producto no encontrado o inactivo'
+            });
+        }
+
+        const stockAnterior = Number(producto.rows[0].stock_actual);
+        const variacion = tipoNormalizado === 'Entrada' ? cantidadAjuste : -cantidadAjuste;
+        const stockResultante = stockAnterior + variacion;
+
+        if (stockResultante < 0) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({
+                success: false,
+                message: `Stock insuficiente. Existencia actual: ${stockAnterior}`
+            });
+        }
+
+        await client.query(
+            `UPDATE producto SET stock_actual = $1 WHERE id_producto = $2`,
+            [stockResultante, productoId]
+        );
+
+        const movimiento = await client.query(
+            `INSERT INTO kardex
+                (id_producto, tipo_movimiento, cantidad, stock_anterior,
+                 stock_resultante, referencia, id_usuario)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING *`,
+            [
+                productoId,
+                `Ajuste ${tipoNormalizado.toLowerCase()}`,
+                cantidadAjuste,
+                stockAnterior,
+                stockResultante,
+                motivoLimpio,
+                usuarioId
+            ]
+        );
+
+        await client.query('COMMIT');
+
+        res.status(201).json({
+            success: true,
+            message: 'Ajuste aplicado correctamente',
+            movimiento: movimiento.rows[0]
+        });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error(error);
+        res.status(500).json({
+            success: false,
+            message: 'Error al realizar el ajuste de inventario'
+        });
+    } finally {
+        client.release();
+    }
+});
+
+app.get('/inventario/ajustes', async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT
+                k.id_movimiento,
+                k.fecha_movimiento,
+                p.nombre AS producto,
+                k.cantidad,
+                k.referencia AS motivo,
+                u.usuario
+            FROM kardex k
+            INNER JOIN producto p ON p.id_producto = k.id_producto
+            INNER JOIN usuario u ON u.id_usuario = k.id_usuario
+            WHERE k.tipo_movimiento = 'Ajuste salida'
+            ORDER BY k.fecha_movimiento DESC, k.id_movimiento DESC
+            LIMIT 100`
+        );
+
+        res.json(result.rows);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({
+            success: false,
+            message: 'Error al consultar el historial de ajustes'
+        });
+    }
+});
+
+app.get('/inventario/kardex', async (req, res) => {
+    try {
+        const idProducto = Number(req.query.idProducto);
+        const params = [];
+        const filtros = [];
+
+        if (Number.isInteger(idProducto) && idProducto > 0) {
+            params.push(idProducto);
+            filtros.push(`k.id_producto = $${params.length}`);
+        }
+
+        if (req.query.fechaInicio) {
+            params.push(req.query.fechaInicio);
+            filtros.push(`k.fecha_movimiento::date >= $${params.length}`);
+        }
+
+        if (req.query.fechaFin) {
+            params.push(req.query.fechaFin);
+            filtros.push(`k.fecha_movimiento::date <= $${params.length}`);
+        }
+
+        const result = await pool.query(
+            `SELECT
+                k.id_movimiento,
+                k.fecha_movimiento,
+                k.id_producto,
+                p.codigo_barras,
+                p.nombre AS producto,
+                k.tipo_movimiento,
+                k.cantidad,
+                k.stock_anterior,
+                k.stock_resultante,
+                k.referencia,
+                u.usuario
+            FROM kardex k
+            INNER JOIN producto p ON p.id_producto = k.id_producto
+            INNER JOIN usuario u ON u.id_usuario = k.id_usuario
+            ${filtros.length > 0 ? `WHERE ${filtros.join(' AND ')}` : ''}
+            ORDER BY k.fecha_movimiento DESC, k.id_movimiento DESC
+            LIMIT 200`,
+            params
+        );
+
+        res.json(result.rows);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({
+            success: false,
+            message: 'Error al consultar el Kardex'
+        });
+    }
+});
+
+app.get('/inventario/alertas', async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT
+                id_producto,
+                codigo_barras,
+                nombre,
+                stock_actual,
+                stock_minimo,
+                CASE
+                    WHEN stock_actual <= 0 THEN 'Agotado'
+                    ELSE 'Stock bajo'
+                END AS alerta
+            FROM producto
+            WHERE stock_actual <= stock_minimo
+            AND estado = 'Activo'
+            ORDER BY stock_actual ASC, nombre`
+        );
+
+        res.json(result.rows);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({
+            success: false,
+            message: 'Error al obtener las alertas de stock'
+        });
+    }
+});
+
 app.listen(PORT, () => {
     console.log(`Servidor corriendo en puerto ${PORT}`);
 });
