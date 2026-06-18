@@ -333,7 +333,10 @@ app.get('/marcas', async (req, res) => {
 
     } catch (error) {
         console.error(error);
-        res.status(500).send('Error al obtener marcas');
+        res.status(500).json({
+            success: false,
+            message: 'Error al obtener marcas'
+        });
     }
 });
 
@@ -497,6 +500,304 @@ app.put('/productos/:id/estado', async (req, res) => {
         res.status(500).json({
             success: false,
             message: 'Error al cambiar estado del producto'
+        });
+    }
+});
+
+// Crear categoría
+app.post('/categorias', async (req, res) => {
+    try {
+        const { nombre, descripcion } = req.body;
+        const nombreLimpio = typeof nombre === 'string' ? nombre.trim() : '';
+        const descripcionLimpia = typeof descripcion === 'string' ? descripcion.trim() : '';
+
+        if (!nombreLimpio) {
+            return res.status(400).json({
+                success: false,
+                message: 'El nombre de la categoría es obligatorio'
+            });
+        }
+
+        const categoriaExistente = await pool.query(
+            'SELECT id_categoria FROM categoria WHERE LOWER(nombre) = LOWER($1)',
+            [nombreLimpio]
+        );
+
+        if (categoriaExistente.rows.length > 0) {
+            return res.status(409).json({
+                success: false,
+                message: 'Ya existe una categoría con ese nombre'
+            });
+        }
+
+        const result = await pool.query(
+            `INSERT INTO categoria (nombre, descripcion, estado)
+            VALUES ($1, $2, $3)
+             RETURNING *`,
+            [nombreLimpio, descripcionLimpia || null, 'Activo']
+        );
+
+        res.status(201).json({
+            success: true,
+            message: 'Categoría guardada correctamente',
+            categoria: result.rows[0]
+        });
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({
+            success: false,
+            message: 'Error al guardar categoría'
+        });
+    }
+});
+
+// Editar categoría
+app.put('/categorias/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { nombre, descripcion } = req.body;
+        const nombreLimpio = typeof nombre === 'string' ? nombre.trim() : '';
+        const descripcionLimpia = typeof descripcion === 'string' ? descripcion.trim() : '';
+
+        if (!nombreLimpio) {
+            return res.status(400).json({
+                success: false,
+                message: 'El nombre de la categoría es obligatorio'
+            });
+        }
+
+        const categoriaExistente = await pool.query(
+            `SELECT id_categoria
+            FROM categoria
+            WHERE LOWER(nombre) = LOWER($1)
+            AND id_categoria <> $2`,
+            [nombreLimpio, id]
+        );
+
+        if (categoriaExistente.rows.length > 0) {
+            return res.status(409).json({
+                success: false,
+                message: 'Ya existe otra categoría con ese nombre'
+            });
+        }
+
+        const result = await pool.query(
+            `UPDATE categoria
+            SET nombre = $1,
+                descripcion = $2
+            WHERE id_categoria = $3
+             RETURNING *`,
+            [nombreLimpio, descripcionLimpia || null, id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Categoría no encontrada'
+            });
+        }
+
+        res.json({
+            success: true,
+            message: 'Categoría actualizada correctamente',
+            categoria: result.rows[0]
+        });
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({
+            success: false,
+            message: 'Error al actualizar categoría'
+        });
+    }
+});
+
+// Activar / Desactivar categoría
+app.put('/categorias/:id/estado', async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        const result = await pool.query(
+            `UPDATE categoria
+            SET estado = CASE
+                WHEN estado = 'Activo' THEN 'Inactivo'
+                ELSE 'Activo'
+            END
+            WHERE id_categoria = $1
+             RETURNING *`,
+            [id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Categoría no encontrada'
+            });
+        }
+
+        const nuevoEstado = result.rows[0].estado;
+
+        res.json({
+            success: true,
+            message: `Categoría ${nuevoEstado.toLowerCase()} correctamente`,
+            categoria: result.rows[0]
+        });
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({
+            success: false,
+            message: 'Error al cambiar estado de categoría'
+        });
+    }
+});
+
+// Crear marca
+app.post('/marcas', async (req, res) => {
+    try {
+        const { nombre, descripcion } = req.body;
+        const nombreLimpio = typeof nombre === 'string' ? nombre.trim() : '';
+        const descripcionLimpia = typeof descripcion === 'string' ? descripcion.trim() : '';
+
+        if (!nombreLimpio) {
+            return res.status(400).json({
+                success: false,
+                message: 'El nombre de la marca es obligatorio'
+            });
+        }
+
+        const marcaExistente = await pool.query(
+            'SELECT id_marca FROM marca WHERE LOWER(nombre) = LOWER($1)',
+            [nombreLimpio]
+        );
+
+        if (marcaExistente.rows.length > 0) {
+            return res.status(409).json({
+                success: false,
+                message: 'Ya existe una marca con ese nombre'
+            });
+        }
+
+        const result = await pool.query(
+            `INSERT INTO marca (nombre, descripcion, estado)
+             VALUES ($1, $2, $3)
+             RETURNING *`,
+            [nombreLimpio, descripcionLimpia || null, 'Activo']
+        );
+
+        res.status(201).json({
+            success: true,
+            message: 'Marca guardada correctamente',
+            marca: result.rows[0]
+        });
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({
+            success: false,
+            message: 'Error al guardar marca'
+        });
+    }
+});
+
+// Editar marca
+app.put('/marcas/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { nombre, descripcion } = req.body;
+        const nombreLimpio = typeof nombre === 'string' ? nombre.trim() : '';
+        const descripcionLimpia = typeof descripcion === 'string' ? descripcion.trim() : '';
+
+        if (!nombreLimpio) {
+            return res.status(400).json({
+                success: false,
+                message: 'El nombre de la marca es obligatorio'
+            });
+        }
+
+        const marcaExistente = await pool.query(
+            `SELECT id_marca
+            FROM marca
+            WHERE LOWER(nombre) = LOWER($1)
+            AND id_marca <> $2`,
+            [nombreLimpio, id]
+        );
+
+        if (marcaExistente.rows.length > 0) {
+            return res.status(409).json({
+                success: false,
+                message: 'Ya existe otra marca con ese nombre'
+            });
+        }
+
+        const result = await pool.query(
+            `UPDATE marca
+             SET nombre = $1,
+                 descripcion = $2
+             WHERE id_marca = $3
+             RETURNING *`,
+            [nombreLimpio, descripcionLimpia || null, id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Marca no encontrada'
+            });
+        }
+
+        res.json({
+            success: true,
+            message: 'Marca actualizada correctamente',
+            marca: result.rows[0]
+        });
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({
+            success: false,
+            message: 'Error al actualizar marca'
+        });
+    }
+});
+
+// Activar / Desactivar marca
+app.put('/marcas/:id/estado', async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        const result = await pool.query(
+            `UPDATE marca
+             SET estado = CASE
+                WHEN estado = 'Activo' THEN 'Inactivo'
+                ELSE 'Activo'
+             END
+             WHERE id_marca = $1
+             RETURNING *`,
+            [id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Marca no encontrada'
+            });
+        }
+
+        const nuevoEstado = result.rows[0].estado;
+
+        res.json({
+            success: true,
+            message: `Marca ${nuevoEstado.toLowerCase()} correctamente`,
+            marca: result.rows[0]
+        });
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({
+            success: false,
+            message: 'Error al cambiar estado de marca'
         });
     }
 });
