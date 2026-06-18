@@ -1406,6 +1406,493 @@ app.get('/inventario/alertas', async (req, res) => {
     }
 });
 
+// Estado y catálogos del módulo de ventas
+app.get('/ventas/estado', async (req, res) => {
+    try {
+        const [caja, productos] = await Promise.all([
+            pool.query(
+                `SELECT id_caja, fecha, hora_apertura, monto_inicial
+                FROM caja
+                WHERE estado = 'Abierta'
+                ORDER BY hora_apertura DESC
+                LIMIT 1`
+            ),
+            pool.query(
+                `SELECT id_producto, codigo_barras, nombre, precio_venta, stock_actual
+                FROM producto
+                WHERE estado = 'Activo'
+                ORDER BY nombre`
+            )
+        ]);
+
+        res.json({
+            cajaActiva: caja.rows[0] || null,
+            productos: productos.rows,
+            metodosPago: ['Efectivo', 'Tarjeta', 'Transferencia']
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({
+            success: false,
+            message: 'Error al obtener los datos para registrar la venta'
+        });
+    }
+});
+
+// Registrar venta, pago, Kardex y descuento de existencias en una transacción
+app.post('/ventas', async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+        const {
+            idUsuario,
+            productos,
+            metodoPago,
+            dineroRecibido,
+            referencia
+        } = req.body;
+
+        const usuarioId = Number(idUsuario);
+        const metodo = typeof metodoPago === 'string' ? metodoPago.trim() : '';
+
+        if (
+            !Number.isInteger(usuarioId) ||
+            !Array.isArray(productos) ||
+            productos.length === 0 ||
+            !['Efectivo', 'Tarjeta', 'Transferencia'].includes(metodo)
+        ) {
+            return res.status(400).json({
+                success: false,
+                message: 'Usuario, productos y método de pago son obligatorios'
+            });
+        }
+
+        await client.query('BEGIN');
+
+        const caja = await client.query(
+            `SELECT id_caja
+            FROM caja
+            WHERE estado = 'Abierta'
+            ORDER BY hora_apertura DESC
+            LIMIT 1
+            FOR UPDATE`
+        );
+
+        if (caja.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({
+                success: false,
+                code: 'CAJA_CERRADA',
+                message: 'Debe realizar la apertura de caja antes de iniciar ventas'
+            });
+        }
+
+        const detalles = [];
+        const productosAgregados = new Set();
+        let subtotal = 0;
+
+        for (const item of productos) {
+            const idProducto = Number(item.idProducto);
+            const cantidad = Number(item.cantidad);
+
+            if (
+                !Number.isInteger(idProducto) ||
+                !Number.isInteger(cantidad) ||
+                cantidad <= 0
+            ) {
+                throw new Error('Los datos de uno de los productos no son válidos');
+            }
+
+            if (productosAgregados.has(idProducto)) {
+                throw new Error('No se puede agregar el mismo producto dos veces');
+            }
+            productosAgregados.add(idProducto);
+
+            const producto = await client.query(
+                `SELECT id_producto, nombre, precio_venta, stock_actual
+                FROM producto
+                WHERE id_producto = $1 AND estado = 'Activo'
+                FOR UPDATE`,
+                [idProducto]
+            );
+
+            if (producto.rows.length === 0) {
+                throw new Error('Uno de los productos no existe o está inactivo');
+            }
+
+            const datosProducto = producto.rows[0];
+            const stockActual = Number(datosProducto.stock_actual);
+
+            if (cantidad > stockActual) {
+                const error = new Error(
+                    `Stock insuficiente para ${datosProducto.nombre}. ` +
+                    `Solicitado: ${cantidad}. Disponible: ${stockActual}`
+                );
+                error.status = 409;
+                throw error;
+            }
+
+            const precioUnitario = Number(datosProducto.precio_venta);
+            const subtotalDetalle = precioUnitario * cantidad;
+            subtotal += subtotalDetalle;
+            detalles.push({
+                idProducto,
+                nombre: datosProducto.nombre,
+                cantidad,
+                precioUnitario,
+                subtotal: subtotalDetalle,
+                stockAnterior: stockActual,
+                stockResultante: stockActual - cantidad
+            });
+        }
+
+        const iva = Number((subtotal * 0.16).toFixed(2));
+        const total = Number((subtotal + iva).toFixed(2));
+        const recibido = Number(dineroRecibido);
+        const referenciaLimpia = typeof referencia === 'string' ? referencia.trim() : '';
+
+        if (metodo === 'Efectivo' && (!Number.isFinite(recibido) || recibido < total)) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+                success: false,
+                message: `El dinero recibido debe ser igual o mayor a $${total.toFixed(2)}`
+            });
+        }
+
+        if (metodo !== 'Efectivo' && !referenciaLimpia) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+                success: false,
+                message: 'La referencia bancaria es obligatoria'
+            });
+        }
+
+        const folio = `V-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+        const venta = await client.query(
+            `INSERT INTO venta
+                (folio, subtotal, iva, total, estado, id_usuario, id_caja)
+            VALUES ($1, $2, $3, $4, 'Completada', $5, $6)
+            RETURNING *`,
+            [folio, subtotal, iva, total, usuarioId, caja.rows[0].id_caja]
+        );
+        const idVenta = venta.rows[0].id_venta;
+
+        for (const detalle of detalles) {
+            await client.query(
+                `INSERT INTO detalle_venta
+                    (id_venta, id_producto, cantidad, precio_unitario, subtotal)
+                VALUES ($1, $2, $3, $4, $5)`,
+                [
+                    idVenta,
+                    detalle.idProducto,
+                    detalle.cantidad,
+                    detalle.precioUnitario,
+                    detalle.subtotal
+                ]
+            );
+
+            await client.query(
+                `UPDATE producto SET stock_actual = $1 WHERE id_producto = $2`,
+                [detalle.stockResultante, detalle.idProducto]
+            );
+
+            await client.query(
+                `INSERT INTO kardex
+                    (id_producto, tipo_movimiento, cantidad, stock_anterior,
+                     stock_resultante, referencia, id_usuario)
+                VALUES ($1, 'Venta', $2, $3, $4, $5, $6)`,
+                [
+                    detalle.idProducto,
+                    detalle.cantidad,
+                    detalle.stockAnterior,
+                    detalle.stockResultante,
+                    folio,
+                    usuarioId
+                ]
+            );
+        }
+
+        let metodoRegistrado = await client.query(
+            `SELECT id_metodo_pago
+            FROM metodo_pago
+            WHERE LOWER(nombre) = LOWER($1)
+            LIMIT 1`,
+            [metodo]
+        );
+
+        if (metodoRegistrado.rows.length === 0) {
+            metodoRegistrado = await client.query(
+                `INSERT INTO metodo_pago (nombre)
+                VALUES ($1)
+                RETURNING id_metodo_pago`,
+                [metodo]
+            );
+        }
+
+        const cambio = metodo === 'Efectivo'
+            ? Number((recibido - total).toFixed(2))
+            : 0;
+
+        await client.query(
+            `INSERT INTO pago_venta
+                (id_venta, id_metodo_pago, monto, dinero_recibido, cambio, referencia)
+            VALUES ($1, $2, $3, $4, $5, $6)`,
+            [
+                idVenta,
+                metodoRegistrado.rows[0].id_metodo_pago,
+                total,
+                metodo === 'Efectivo' ? recibido : null,
+                metodo === 'Efectivo' ? cambio : null,
+                metodo === 'Efectivo' ? null : referenciaLimpia
+            ]
+        );
+
+        await client.query(
+            `UPDATE caja
+            SET ventas_calculadas = COALESCE(ventas_calculadas, 0) + $1
+            WHERE id_caja = $2`,
+            [total, caja.rows[0].id_caja]
+        );
+
+        await client.query('COMMIT');
+
+        res.status(201).json({
+            success: true,
+            message: 'Venta registrada correctamente',
+            venta: {
+                ...venta.rows[0],
+                metodoPago: metodo,
+                dineroRecibido: metodo === 'Efectivo' ? recibido : null,
+                cambio,
+                referencia: referenciaLimpia || null,
+                productos: detalles
+            }
+        });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error(error);
+        res.status(error.status || 400).json({
+            success: false,
+            message: error.message || 'Error al registrar la venta'
+        });
+    } finally {
+        client.release();
+    }
+});
+
+app.get('/ventas', async (req, res) => {
+    try {
+        const params = [];
+        const filtros = [];
+
+        if (req.query.fechaInicio) {
+            params.push(req.query.fechaInicio);
+            filtros.push(`v.fecha_venta::date >= $${params.length}`);
+        }
+        if (req.query.fechaFin) {
+            params.push(req.query.fechaFin);
+            filtros.push(`v.fecha_venta::date <= $${params.length}`);
+        }
+
+        const result = await pool.query(
+            `SELECT
+                v.id_venta,
+                v.folio,
+                v.fecha_venta,
+                v.subtotal,
+                v.iva,
+                v.total,
+                v.estado,
+                u.usuario,
+                COUNT(d.id_detalle_venta) AS productos
+            FROM venta v
+            INNER JOIN usuario u ON u.id_usuario = v.id_usuario
+            LEFT JOIN detalle_venta d ON d.id_venta = v.id_venta
+            ${filtros.length ? `WHERE ${filtros.join(' AND ')}` : ''}
+            GROUP BY v.id_venta, u.usuario
+            ORDER BY v.fecha_venta DESC
+            LIMIT 200`,
+            params
+        );
+
+        res.json(result.rows);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({
+            success: false,
+            message: 'Error al consultar el historial de ventas'
+        });
+    }
+});
+
+app.get('/ventas/:id', async (req, res) => {
+    try {
+        const venta = await pool.query(
+            `SELECT
+                v.*,
+                u.usuario,
+                mp.nombre AS metodo_pago,
+                pv.dinero_recibido,
+                pv.cambio,
+                pv.referencia
+            FROM venta v
+            INNER JOIN usuario u ON u.id_usuario = v.id_usuario
+            LEFT JOIN pago_venta pv ON pv.id_venta = v.id_venta
+            LEFT JOIN metodo_pago mp ON mp.id_metodo_pago = pv.id_metodo_pago
+            WHERE v.id_venta = $1`,
+            [req.params.id]
+        );
+
+        if (venta.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Venta no encontrada'
+            });
+        }
+
+        const detalles = await pool.query(
+            `SELECT
+                d.id_producto,
+                p.nombre AS producto,
+                d.cantidad,
+                d.precio_unitario,
+                d.subtotal
+            FROM detalle_venta d
+            INNER JOIN producto p ON p.id_producto = d.id_producto
+            WHERE d.id_venta = $1
+            ORDER BY d.id_detalle_venta`,
+            [req.params.id]
+        );
+
+        res.json({
+            ...venta.rows[0],
+            detalles: detalles.rows
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({
+            success: false,
+            message: 'Error al consultar el detalle de la venta'
+        });
+    }
+});
+
+// Cancelar venta y devolver productos al inventario
+app.put('/ventas/:id/cancelar', async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+        const idVenta = Number(req.params.id);
+        const idUsuario = Number(req.body.idUsuario);
+        const motivo = typeof req.body.motivo === 'string' ? req.body.motivo.trim() : '';
+        const observaciones = typeof req.body.observaciones === 'string'
+            ? req.body.observaciones.trim()
+            : '';
+
+        if (!Number.isInteger(idVenta) || !Number.isInteger(idUsuario) || !motivo) {
+            return res.status(400).json({
+                success: false,
+                message: 'Venta, motivo y usuario son obligatorios'
+            });
+        }
+
+        await client.query('BEGIN');
+
+        const venta = await client.query(
+            `SELECT id_venta, folio, total, estado, id_caja
+            FROM venta
+            WHERE id_venta = $1
+            FOR UPDATE`,
+            [idVenta]
+        );
+
+        if (venta.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({
+                success: false,
+                message: 'Venta no encontrada'
+            });
+        }
+
+        if (venta.rows[0].estado === 'Cancelada') {
+            await client.query('ROLLBACK');
+            return res.status(409).json({
+                success: false,
+                message: 'La venta ya fue cancelada'
+            });
+        }
+
+        const detalles = await client.query(
+            `SELECT id_producto, cantidad
+            FROM detalle_venta
+            WHERE id_venta = $1`,
+            [idVenta]
+        );
+
+        for (const detalle of detalles.rows) {
+            const producto = await client.query(
+                `SELECT stock_actual
+                FROM producto
+                WHERE id_producto = $1
+                FOR UPDATE`,
+                [detalle.id_producto]
+            );
+            const stockAnterior = Number(producto.rows[0].stock_actual);
+            const stockResultante = stockAnterior + Number(detalle.cantidad);
+
+            await client.query(
+                `UPDATE producto SET stock_actual = $1 WHERE id_producto = $2`,
+                [stockResultante, detalle.id_producto]
+            );
+
+            await client.query(
+                `INSERT INTO kardex
+                    (id_producto, tipo_movimiento, cantidad, stock_anterior,
+                     stock_resultante, referencia, id_usuario)
+                VALUES ($1, 'Devolución', $2, $3, $4, $5, $6)`,
+                [
+                    detalle.id_producto,
+                    detalle.cantidad,
+                    stockAnterior,
+                    stockResultante,
+                    `${venta.rows[0].folio} - ${motivo}${observaciones ? `: ${observaciones}` : ''}`,
+                    idUsuario
+                ]
+            );
+        }
+
+        await client.query(
+            `UPDATE venta SET estado = 'Cancelada' WHERE id_venta = $1`,
+            [idVenta]
+        );
+
+        await client.query(
+            `UPDATE caja
+            SET ventas_calculadas = GREATEST(
+                COALESCE(ventas_calculadas, 0) - $1,
+                0
+            )
+            WHERE id_caja = $2`,
+            [venta.rows[0].total, venta.rows[0].id_caja]
+        );
+
+        await client.query('COMMIT');
+        res.json({
+            success: true,
+            message: 'Venta cancelada correctamente. Inventario y Kardex actualizados'
+        });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error(error);
+        res.status(500).json({
+            success: false,
+            message: 'Error al cancelar la venta'
+        });
+    } finally {
+        client.release();
+    }
+});
+
 app.listen(PORT, () => {
     console.log(`Servidor corriendo en puerto ${PORT}`);
 });
